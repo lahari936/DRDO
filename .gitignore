@@ -1,0 +1,7 @@
+ivhm_data/
+ivhm_outputs/
+ivhm_outputs.zip
+*.part
+.venv/
+__pycache__/
+.ipynb_checkpoints/
