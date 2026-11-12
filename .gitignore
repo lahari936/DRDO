@@ -5,3 +5,4 @@ ivhm_outputs.zip
 .venv/
 __pycache__/
 .ipynb_checkpoints/
+runs/

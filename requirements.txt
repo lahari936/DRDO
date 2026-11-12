@@ -4,3 +4,5 @@ scipy>=1.9
 scikit-learn>=1.2
 matplotlib>=3.6
 joblib>=1.2
+# optional: enables the C-MAPSS 1D-CNN (pre-installed on Colab)
+# torch>=2.0

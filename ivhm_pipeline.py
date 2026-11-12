@@ -46,7 +46,7 @@ from sklearn.metrics import (accuracy_score, balanced_accuracy_score, f1_score, 
 warnings.filterwarnings('ignore', category=ConvergenceWarning)
 
 IN_COLAB = 'google.colab' in sys.modules
-SEED = 42
+SEED = int(os.environ.get('IVHM_SEED', '42'))   # set IVHM_SEED for repeated runs (run_seeds.sh)
 np.random.seed(SEED)
 QUICK_MODE = os.environ.get('IVHM_QUICK', '0') == '1'   # smaller synthetic fleet for a fast smoke test
 
@@ -88,6 +88,8 @@ HYD_SENSORS = {'PS1': 100, 'PS2': 100, 'PS3': 100, 'PS4': 100, 'PS5': 100, 'PS6'
                'FS1': 10, 'FS2': 10, 'TS1': 1, 'TS2': 1, 'TS3': 1, 'TS4': 1, 'VS1': 1,
                'CE': 1, 'CP': 1, 'SE': 1}          # sensor -> sampling rate (Hz), from UCI documentation
 BATTERIES = ['B0005', 'B0006', 'B0007', 'B0018']
+# Other NASA cells in the same archive (different load profiles / temperatures), used for an extended RUL test
+BATTERIES_EXTRA = [f'B{n:04d}' for n in list(range(25, 35)) + [36] + list(range(38, 57))]
 
 REAL_DATASETS = {
     'cmapss': {
@@ -98,6 +100,7 @@ REAL_DATASETS = {
     'battery': {
         'url': 'https://phm-datasets.s3.amazonaws.com/NASA/5.+Battery+Data+Set.zip',
         'file': 'battery.zip', 'wanted': [f'{b}.mat' for b in BATTERIES],
+        'optional': [f'{b}.mat' for b in BATTERIES_EXTRA],
         'data_type': 'REAL',
         'source': 'NASA PCoE Li-ion 18650 aging tests B0005/6/7/18 (Saha & Goebel, 2007)'},
     'hydraulic': {
@@ -151,15 +154,16 @@ for key, cfg in REAL_DATASETS.items():
     print(f'[{key}] {cfg["source"]}')
     out = DATA_DIR / key
     out.mkdir(exist_ok=True)
-    existing = {w: out / w for w in cfg['wanted'] if (out / w).exists()}
-    if len(existing) == len(cfg['wanted']):
+    want_all = cfg['wanted'] + cfg.get('optional', [])
+    existing = {w: out / w for w in want_all if (out / w).exists()}
+    if len(existing) == len(want_all):
         DATA_FILES[key], DATA_OK[key] = existing, True
         print('  already extracted')
         continue
     ok = download(cfg['url'], DATA_DIR / cfg['file'])
     if ok:
         try:
-            files = extract_matching(DATA_DIR / cfg['file'], set(cfg['wanted']), out)
+            files = extract_matching(DATA_DIR / cfg['file'], set(want_all), out)
             miss = set(cfg['wanted']) - set(files)
             if miss:
                 print('  missing after extraction:', sorted(miss))
@@ -196,9 +200,10 @@ def load_nasa_battery(path):
             continue
         d = c['data']
         k += 1
+        cap = np.atleast_1d(np.asarray(d.get('Capacity', np.nan), dtype=float))
         cycles.append({'battery': name, 'discharge_idx': k,
                        'ambient_temp': float(c['ambient_temperature']),
-                       'capacity_ah': float(np.atleast_1d(d.get('Capacity', np.nan))[0]),
+                       'capacity_ah': float(cap[0]) if cap.size else np.nan,
                        't': np.asarray(d['Time'], float), 'v': np.asarray(d['Voltage_measured'], float),
                        'i': np.asarray(d['Current_measured'], float),
                        'temp': np.asarray(d['Temperature_measured'], float)})
@@ -207,6 +212,16 @@ def load_nasa_battery(path):
 if DATA_OK['battery']:
     bat_cycles = [c for b in BATTERIES for c in load_nasa_battery(DATA_FILES['battery'][f'{b}.mat'])]
     print('Battery discharge cycles loaded:', pd.Series([c['battery'] for c in bat_cycles]).value_counts().to_dict())
+    bat_cycles_extra = []
+    for b in BATTERIES_EXTRA:
+        p = DATA_FILES['battery'].get(f'{b}.mat')
+        if p is None:
+            continue
+        try:
+            bat_cycles_extra += load_nasa_battery(p)
+        except Exception as e:
+            print(f'  {b}: skipped ({type(e).__name__}: {e})')
+    print('Extra NASA cells loaded:', len({c['battery'] for c in bat_cycles_extra}), 'cells,', len(bat_cycles_extra), 'discharge cycles')
 
 # ---- Load UCI hydraulic rig (REAL)
 if DATA_OK['hydraulic']:
@@ -541,12 +556,16 @@ for name in SYN_SPECS:
 
 PARTIAL_T = 1000.0      # seconds of each discharge used for battery features
 if DATA_OK['battery']:
-    n0 = len(bat_cycles)
-    bat_cycles = [c for c in bat_cycles
-                  if c['t'].max() >= PARTIAL_T and 0.5 < c['capacity_ah'] < 2.5
-                  and np.all(np.isfinite(c['v'])) and np.all(np.isfinite(c['temp'])) and np.all(np.diff(c['t']) > 0)]
+    def valid_cycle(c):
+        return (c['t'].size > 10 and c['t'].max() >= PARTIAL_T and 0.5 < c['capacity_ah'] < 2.5
+                and np.all(np.isfinite(c['v'])) and np.all(np.isfinite(c['temp'])) and np.all(np.diff(c['t']) > 0))
+    n0, n0x = len(bat_cycles), len(bat_cycles_extra)
+    bat_cycles = [c for c in bat_cycles if valid_cycle(c)]
+    bat_cycles_extra = [c for c in bat_cycles_extra if valid_cycle(c)]
     clean_log.append({'dataset': 'nasa_battery', 'type': 'REAL', 'values_repaired': 0, 'remaining_nan': 0,
                       'records_dropped': n0 - len(bat_cycles)})
+    clean_log.append({'dataset': 'nasa_battery_extra', 'type': 'REAL', 'values_repaired': 0, 'remaining_nan': 0,
+                      'records_dropped': n0x - len(bat_cycles_extra)})
 
 if DATA_OK['cmapss']:
     sensor_cols = [f's{i}' for i in range(1, 22)]
@@ -601,15 +620,40 @@ def causal_rolling(df, group_col, cols, w, stat='mean'):
     r = (r.mean() if stat == 'mean' else r.std()).reset_index(level=0, drop=True).sort_index()
     return r.fillna(0.0).add_suffix(f'_{stat}{w}')
 
+def actuator_physics_features(X, fs):
+    # Per-window least-squares identification of  current = a*acc + b*vel + c*pos + d*sign(vel) + e
+    # (inertia, viscous friction, hinge stiffness, Coulomb friction, offset) plus servo tracking-error statistics.
+    # Uses only the actuator's own sensors, as on-board EMA parameter estimation would.
+    from scipy.ndimage import uniform_filter1d
+    cmd, pos, cur, speed = (X[:, :, j].astype(np.float64) for j in (0, 1, 2, 4))
+    vel = uniform_filter1d(speed * 6 / 100, 5, axis=1)          # motor rpm -> surface deg/s (gear 100)
+    acc = np.gradient(vel, 1 / fs, axis=1)
+    A = np.stack([acc, vel, pos, np.sign(vel), np.ones_like(vel)], -1)
+    AtA = np.einsum('ntk,ntl->nkl', A, A) + 1e-6 * np.eye(5)
+    coef = np.linalg.solve(AtA, np.einsum('ntk,nt->nk', A, cur)[..., None])[..., 0]
+    resid = cur - np.einsum('ntk,nk->nt', A, coef)
+    err = pos - cmd
+    cmd_vel = np.abs(np.gradient(cmd, 1 / fs, axis=1))
+    rev = cmd_vel < 0.1 * cmd_vel.max(1, keepdims=True)          # around command reversals
+    rev_err = np.where(rev, np.abs(err - err.mean(1, keepdims=True)), np.nan)
+    f = {f'phys__coef_{k}': coef[:, i] for i, k in enumerate(['inertia', 'viscous', 'hinge', 'coulomb', 'offset'])}
+    f.update({'phys__resid_std': resid.std(1), 'phys__track_err_mean': err.mean(1), 'phys__track_err_std': err.std(1),
+              'phys__track_err_absmax': np.abs(err).max(1), 'phys__reversal_err': np.nanmean(rev_err, axis=1)})
+    return f
+
 # ---- Synthetic fault tables and run-to-failure tables
 FAULT_TASKS, RTF_TABLES, RTF_FEATS = {}, {}, {}
 for name, sp in SYN_SPECS.items():
     fr = syn_fault_raw[name]
     Xf = tensor_features(fr['X'], sp['sensors'], sp['fs'])
+    if name == 'actuators':
+        Xf = pd.concat([Xf, pd.DataFrame(actuator_physics_features(fr['X'], sp['fs']))], axis=1)
     FAULT_TASKS[name] = {'X': Xf, 'y': fr['label'], 'groups': fr['unit'], 'classes': ['normal'] + sp['faults'],
                          'nominal': 'normal', 'data_type': 'SYNTHETIC'}
     rr = syn_rtf_raw[name]
     base = tensor_features(rr['X'], sp['sensors'], sp['fs'])
+    if name == 'actuators':
+        base = pd.concat([base, pd.DataFrame(actuator_physics_features(rr['X'], sp['fs']))], axis=1)
     meta = pd.DataFrame({'unit': rr['unit'], 'age': rr['cycle'], 'rul': rr['rul']})
     tab = pd.concat([meta, base], axis=1)
     tab = pd.concat([tab, causal_rolling(tab, 'unit', list(base.columns), 5)], axis=1)
@@ -624,7 +668,14 @@ HYD_COMPONENTS = {'cooler': 100, 'valve': 100, 'pump': 0, 'accumulator': 130}   
 # Only ~1 % of rig cycles are fully nominal, so detection targets critical faults (balanced, operationally meaningful).
 HYD_CRITICAL = {'cooler': lambda v: v <= 3, 'valve': lambda v: v <= 80, 'pump': lambda v: v >= 2, 'accumulator': lambda v: v <= 100}
 if DATA_OK['hydraulic']:
-    hyd_X = pd.concat([pd.DataFrame(window_features(hyd_raw[s], fs, s)) for s, fs in HYD_SENSORS.items()], axis=1)
+    def segment_features(x, n_seg, prefix):
+        # Mean and std of each of n_seg consecutive slices of the 60 s load cycle.
+        f = {}
+        for k, s in enumerate(np.array_split(x.astype(np.float64), n_seg, axis=1)):
+            f[f'{prefix}__seg{k}_mean'] = s.mean(1); f[f'{prefix}__seg{k}_std'] = s.std(1)
+        return f
+    hyd_X = pd.concat([pd.DataFrame(window_features(hyd_raw[s], fs, s) | segment_features(hyd_raw[s], 6, s))
+                       for s, fs in HYD_SENSORS.items()], axis=1)
     hyd_any_fault = np.zeros(len(hyd_profile), int)
     for comp, is_crit in HYD_CRITICAL.items():
         hyd_any_fault |= is_crit(hyd_profile[comp].values).astype(int)
@@ -767,6 +818,43 @@ for a, name in zip(axes.ravel(), names):
 savefig('diagnosis_confusion_matrices')
 
 # %% [26]
+from sklearn.model_selection import cross_val_predict
+
+class NotNormalDetector:
+    # Wraps a multiclass diagnoser as a fault detector: P(fault) = 1 - P(normal class).
+    def __init__(self, diagnoser, normal_label=0):
+        self.diagnoser, self.normal_label = diagnoser, normal_label
+
+    def predict_proba(self, X):
+        p = self.diagnoser.predict_proba(X)
+        pf = 1 - p[:, list(self.diagnoser.classes_).index(self.normal_label)]
+        return np.column_stack([1 - pf, pf])
+
+DET_SOURCE = {}
+for name, task in FAULT_TASKS.items():
+    X, g, dt = task['X'], task['groups'], task['data_type']
+    y = (task['y'] > 0).astype(int)
+    tr, te = SPLITS[name]
+    binary = DET_MODELS[name]
+    yb = binary['model'].predict(X.iloc[te])
+    choice, yhat, model_name = 'binary', yb, binary['best']
+    if name in DIAG_MODELS:
+        d = DIAG_MODELS[name]
+        cv = GroupKFold(n_splits=min(5, len(np.unique(g[tr]))))
+        p_cv = cross_val_predict(clone(d['model']), X.iloc[tr], task['y'][tr], groups=g[tr], cv=cv, method='predict_proba')
+        cv_bal = balanced_accuracy_score(y[tr], (1 - p_cv[:, 0] >= 0.5).astype(int))
+        record(name, dt, 'detection_from_diagnosis', d['best'], 'balanced_accuracy', cv_bal, split='cv_train')
+        yd = (NotNormalDetector(d['model']).predict_proba(X.iloc[te])[:, 1] >= 0.5).astype(int)
+        record(name, dt, 'detection_from_diagnosis', d['best'], 'accuracy', accuracy_score(y[te], yd))
+        record(name, dt, 'detection_from_diagnosis', d['best'], 'balanced_accuracy', balanced_accuracy_score(y[te], yd))
+        if cv_bal > binary['cv'][binary['best']]:
+            choice, yhat, model_name = 'diagnosis', yd, d['best']
+        print(f'{name:13s} CV bal_acc binary={binary["cv"][binary["best"]]:.3f} from-diagnosis={cv_bal:.3f} -> {choice}')
+    DET_SOURCE[name] = choice
+    record(name, dt, 'detection_selected', f'{choice}:{model_name}', 'accuracy', accuracy_score(y[te], yhat))
+    record(name, dt, 'detection_selected', f'{choice}:{model_name}', 'balanced_accuracy', balanced_accuracy_score(y[te], yhat))
+
+# %% [28]
 def health_state(rul, crit, warn):
     return np.digitize(rul, [crit + 1e-9, warn + 1e-9])      # 0 critical, 1 warning, 2 healthy
 
@@ -808,7 +896,7 @@ for a, name in zip(ax.ravel(), SYN_SPECS):
     a.legend(fontsize=7)
 savefig('rul_synthetic_test_units')
 
-# %% [27]
+# %% [29]
 # ---- C-MAPSS FD001 (SIMULATED-BENCHMARK): train on official train set, test on official test set
 CRIT_CM, WARN_CM, TOL_CM = 30, 75, 15
 if DATA_OK['cmapss']:
@@ -845,7 +933,94 @@ if DATA_OK['cmapss']:
 else:
     print('C-MAPSS not available: propulsion RUL NOT RUN')
 
-# %% [28]
+# %% [30]
+# ---- Deep model for C-MAPSS (SIMULATED-BENCHMARK): 1D-CNN over the last 30 cycles of normalised sensors.
+# Runs on GPU when one is present, otherwise on CPU (a few minutes). Early stopping uses 20 % of TRAIN engines;
+# the official test set is only scored once at the end. Skipped cleanly if PyTorch is not installed.
+CNN_WIN = 30
+try:
+    import torch
+    from torch import nn
+    TORCH_OK = True
+except ImportError:
+    TORCH_OK = False
+    print('PyTorch not installed: C-MAPSS 1D-CNN NOT RUN (pip install torch to enable)')
+
+def make_windows(df, feats, mu, sd, win):
+    # One window per cycle, ending at that cycle; early cycles are left-padded with the unit's first reading.
+    X, ends = [], []
+    for _, d in df.groupby('unit', sort=False):
+        a = (d[feats].to_numpy(np.float32) - mu) / sd
+        a = np.vstack([np.repeat(a[:1], win - 1, axis=0), a])
+        X.append(np.stack([a[i:i + win] for i in range(len(d))]))
+        ends.append(d.index.to_numpy())
+    return np.concatenate(X), np.concatenate(ends)
+
+if DATA_OK['cmapss'] and TORCH_OK:
+    t0 = time.time()
+    torch.manual_seed(SEED)
+    dev = 'cuda' if torch.cuda.is_available() else 'cpu'
+    mu = cm_tr_tab[CM_SENSORS].mean().to_numpy(np.float32)
+    sd = cm_tr_tab[CM_SENSORS].std().to_numpy(np.float32) + 1e-6
+    Xw, idx = make_windows(cm_tr_tab, CM_SENSORS, mu, sd, CNN_WIN)
+    yw = np.minimum(cm_tr_tab.loc[idx, 'rul'].to_numpy(np.float32), RUL_CAP_CM)
+    tr_i, va_i = split_by_group(cm_tr_tab.loc[idx, 'unit'].to_numpy(), test_size=0.2)
+
+    class CNN1D(nn.Module):
+        def __init__(self, n_in, win):
+            super().__init__()
+            self.net = nn.Sequential(
+                nn.Conv1d(n_in, 32, 5, padding=2), nn.ReLU(), nn.Conv1d(32, 64, 5, padding=2), nn.ReLU(),
+                nn.Conv1d(64, 64, 3, padding=1), nn.ReLU(), nn.Flatten(), nn.Dropout(0.2),
+                nn.Linear(64 * win, 64), nn.ReLU(), nn.Linear(64, 1))
+
+        def forward(self, x):                       # x: (batch, window, sensors)
+            return self.net(x.transpose(1, 2)).squeeze(-1)
+
+    to_t = lambda a: torch.tensor(a, device=dev)
+    Xt, yt, Xv, yv = to_t(Xw[tr_i]), to_t(yw[tr_i]), to_t(Xw[va_i]), to_t(yw[va_i])
+    net = CNN1D(len(CM_SENSORS), CNN_WIN).to(dev)
+    opt = torch.optim.Adam(net.parameters(), lr=1e-3)
+    best_rmse, best_state, bad, epoch = np.inf, None, 0, 0
+    for epoch in range(1, 101):
+        net.train()
+        perm = torch.randperm(len(Xt), device=dev)
+        for b in range(0, len(Xt), 256):
+            j = perm[b:b + 256]
+            opt.zero_grad()
+            nn.functional.mse_loss(net(Xt[j]), yt[j]).backward()
+            opt.step()
+        net.eval()
+        with torch.no_grad():
+            v = float(torch.sqrt(nn.functional.mse_loss(net(Xv).clamp(0, RUL_CAP_CM), yv)))
+        if v < best_rmse - 0.01:
+            best_rmse, bad = v, 0
+            best_state = {k: t.detach().clone() for k, t in net.state_dict().items()}
+        else:
+            bad += 1
+            if bad >= 10:
+                break
+    net.load_state_dict(best_state); net.eval()
+    record('propulsion_cmapss', 'SIMULATED-BENCHMARK', 'rul', 'CNN1D', 'rmse', best_rmse, split='val_train_units')
+    print(f'CNN1D on {dev}: stopped after {epoch} epochs, validation RMSE (held-out TRAIN engines) = {best_rmse:.2f}')
+
+    Xte_w, idx_te = make_windows(cm_te_tab, CM_SENSORS, mu, sd, CNN_WIN)
+    with torch.no_grad():
+        pred = np.concatenate([net(to_t(Xte_w[b:b + 4096])).clamp(0, RUL_CAP_CM).cpu().numpy()
+                               for b in range(0, len(Xte_w), 4096)])
+    yhat_cnn = pd.Series(pred, index=idx_te).reindex(cm_te_tab.index).to_numpy()
+    for split, msk in (('test_last_cycle', is_last), ('test_all_cycles', np.ones_like(is_last))):
+        for k, v in rul_metrics(y_all[msk], yhat_cnn[msk], TOL_CM, CRIT_CM, WARN_CM).items():
+            record('propulsion_cmapss', 'SIMULATED-BENCHMARK', 'rul', 'CNN1D', k, v, split=split)
+    record('propulsion_cmapss', 'SIMULATED-BENCHMARK', 'rul', 'CNN1D', 'nasa_score', nasa_score(y_all[is_last], yhat_cnn[is_last]),
+           split='test_last_cycle')
+    m = rul_metrics(y_all[is_last], yhat_cnn[is_last], TOL_CM, CRIT_CM, WARN_CM)
+    print(f'CNN1D official test (last cycle): RMSE={m["rmse"]:.2f} MAE={m["mae"]:.2f} state_acc={m["state_accuracy"]:.3f} '
+          f'tol_acc={m["tolerance_accuracy"]:.3f} NASA score={nasa_score(y_all[is_last], yhat_cnn[is_last]):.0f} ({time.time() - t0:.0f} s)')
+    torch.save({'state_dict': net.state_dict(), 'mu': mu, 'sd': sd, 'sensors': CM_SENSORS, 'window': CNN_WIN},
+               MODEL_DIR / 'rul_propulsion_cmapss_cnn1d.pt')
+
+# %% [31]
 # ---- NASA Li-ion battery (REAL): SOH estimation and RUL with nested leave-one-battery-out
 EOL_AH, CRIT_BAT, WARN_BAT, TOL_BAT = 1.4, 15, 40, 10
 BAT_FOLD_MODELS = {}
@@ -907,7 +1082,40 @@ if DATA_OK['battery']:
 else:
     print('Battery data not available: SOH/RUL NOT RUN')
 
-# %% [30]
+# %% [32]
+# ---- Extended battery RUL (REAL): every NASA cell that loses 30 % of its initial capacity
+# Cells differ in load current, cut-off voltage and ambient temperature, so this is a harder generalisation test
+# than the 4-cell result above. EOL = first cycle where the 3-cycle rolling median of capacity < 70 % of initial.
+if DATA_OK['battery'] and bat_cycles_extra:
+    t0 = time.time()
+    ext = pd.DataFrame([{'battery': c['battery'], 'age': c['discharge_idx'], 'capacity_ah': c['capacity_ah']} | battery_features(c)
+                        for c in bat_cycles + bat_cycles_extra]).reset_index(drop=True)
+    ext = pd.concat([ext, causal_rolling(ext, 'battery', BAT_BASE, 5)], axis=1)
+    frac = ext.capacity_ah / ext.groupby('battery').capacity_ah.transform(lambda s: s.iloc[:3].mean())
+    ext['cap_frac_med3'] = frac.groupby(ext.battery).transform(lambda s: s.rolling(3, min_periods=1).median())
+    eol_ext = {b: d.loc[d.cap_frac_med3 < 0.7, 'age'].min() for b, d in ext.groupby('battery')}
+    elig = sorted(b for b, e in eol_ext.items() if pd.notna(e) and e >= 20)
+    print(f'{ext.battery.nunique()} cells with valid cycles; {len(elig)} reach 70 % capacity after >= 20 cycles:', elig)
+    if len(elig) >= 4:
+        xt = ext[ext.battery.isin(elig)].copy()
+        xt['rul'] = xt.battery.map(eol_ext) - xt.age
+        xt = xt[xt.rul >= 0]
+        yt_all, yp_all = [], []
+        for held_b in elig:
+            tr = (xt.battery != held_b).to_numpy(); te = ~tr
+            best, model, _ = select_and_fit(reg_candidates(), xt.loc[tr, BAT_FEATS + ['age']], xt.rul[tr],
+                                            xt.battery[tr].to_numpy(), 'neg_root_mean_squared_error')
+            yt_all.append(xt.rul[te].to_numpy(float)); yp_all.append(np.clip(model.predict(xt.loc[te, BAT_FEATS + ['age']]), 0, None))
+        yt_e, yp_e = np.concatenate(yt_all), np.concatenate(yp_all)
+        for k, v in rul_metrics(yt_e, yp_e, TOL_BAT, CRIT_BAT, WARN_BAT).items():
+            record('li_ion_battery', 'REAL', 'rul_extended', 'nested-LOBO', k, v, split='lobo')
+        m = rul_metrics(yt_e, yp_e, TOL_BAT, CRIT_BAT, WARN_BAT)
+        print(f'Extended LOBO over {len(elig)} cells: RMSE={m["rmse"]:.1f} cycles, state_acc={m["state_accuracy"]:.3f}, '
+              f'tol_acc={m["tolerance_accuracy"]:.3f} ({time.time() - t0:.0f} s)')
+    else:
+        print('Fewer than 4 eligible cells: extended battery RUL NOT RUN')
+
+# %% [34]
 class IVHMSystem:
     STATUS_ORDER = {'NORMAL': 0, 'CAUTION': 1, 'CRITICAL': 2}
 
@@ -950,7 +1158,8 @@ class IVHMSystem:
 
 ivhm = IVHMSystem()
 for name in SYN_SPECS:
-    ivhm.register(name, 'SYNTHETIC', detector=DET_MODELS[name]['model'], diagnoser=DIAG_MODELS[name]['model'],
+    detector = NotNormalDetector(DIAG_MODELS[name]['model']) if DET_SOURCE[name] == 'diagnosis' else DET_MODELS[name]['model']
+    ivhm.register(name, 'SYNTHETIC', detector=detector, diagnoser=DIAG_MODELS[name]['model'],
                   classes=DIAG_MODELS[name]['classes'], nominal='normal', rul_model=RUL_MODELS[name]['model'],
                   rul_feats=RUL_MODELS[name]['feats'], rul_unit='flights', rul_crit=CRIT_SYN)
 if DATA_OK['hydraulic']:
@@ -997,7 +1206,7 @@ pd.set_option('display.width', 200)
 print(vehicle_report.round(3).to_string(index=False))
 print('\nVEHICLE STATUS:', vehicle_status)
 
-# %% [32]
+# %% [36]
 res = pd.DataFrame(RESULTS)
 ACC_METRICS = ['accuracy', 'balanced_accuracy', 'state_accuracy', 'tolerance_accuracy', 'soh_accuracy']
 
@@ -1012,11 +1221,11 @@ summary = held[held.metric.isin(ACC_METRICS + ['macro_f1', 'roc_auc', 'rmse', 'm
 print('\nHeld-out results:')
 print(summary.to_string())
 
-# %% [33]
-headline = held[((held.task.isin(['detection', 'diagnosis'])) & (held.metric == 'balanced_accuracy')) |
-                ((held.task == 'rul') & (held.metric == 'state_accuracy') & (held.split != 'test_all_cycles')) |
+# %% [37]
+headline = held[((held.task.isin(['detection_selected', 'diagnosis'])) & (held.metric == 'balanced_accuracy')) |
+                ((held.task.isin(['rul', 'rul_extended'])) & (held.metric == 'state_accuracy') & (held.split != 'test_all_cycles')) |
                 ((held.task == 'soh') & (held.metric == 'soh_accuracy'))].copy()
-headline['label'] = headline.subsystem + ' / ' + headline.task
+headline['label'] = headline.subsystem + ' / ' + headline.task + np.where(headline.model == 'CNN1D', ' (CNN1D)', '')
 colors = {'REAL': 'tab:green', 'SIMULATED-BENCHMARK': 'tab:orange', 'SYNTHETIC': 'tab:blue'}
 headline = headline.sort_values(['data_type', 'label'])
 fig, ax = plt.subplots(figsize=(10, 0.32 * len(headline) + 1.5))
@@ -1028,13 +1237,13 @@ ax.set_xlim(0, 1.0); ax.set_xlabel('held-out score (balanced acc / state acc / S
 ax.set_title('Headline held-out scores by subsystem and data type')
 savefig('summary_headline_scores')
 
-det_cmp = held[(held.metric == 'balanced_accuracy') & held.task.isin(['detection', 'detection_unsupervised'])].pivot_table(
+det_cmp = held[(held.metric == 'balanced_accuracy') & held.task.isin(['detection', 'detection_from_diagnosis', 'detection_unsupervised'])].pivot_table(
     index='subsystem', columns='task', values='value')
 det_cmp.plot.bar(figsize=(12, 4), title='Supervised vs unsupervised (Isolation Forest) detection, balanced accuracy')
 plt.axhline(ACC_TARGET, c='r', ls='--'); plt.ylim(0, 1.05)
 savefig('summary_detection_supervised_vs_unsupervised')
 
-# %% [35]
+# %% [39]
 imp_names = [n for n in DIAG_MODELS]
 cols = 3; rows = int(np.ceil(len(imp_names) / cols))
 fig, axes = plt.subplots(rows, cols, figsize=(6.5 * cols, 3.3 * rows))
@@ -1052,7 +1261,7 @@ for a, name in zip(axes.ravel(), imp_names):
     a.tick_params(axis='y', labelsize=7)
 savefig('diagnosis_permutation_importance')
 
-# %% [37]
+# %% [41]
 for name, d in DET_MODELS.items():
     joblib.dump({'model': d['model'], 'iso': d['iso'], 'iso_thr': d['iso_thr']}, MODEL_DIR / f'detect_{name.replace(":", "_")}.joblib')
 for name, d in DIAG_MODELS.items():
@@ -1067,7 +1276,8 @@ model_card = {
                  for k, v in REAL_DATASETS.items()},
     'synthetic_subsystems': {n: {'sensors': s['sensors'], 'faults': s['faults'], 'progressive': s['progressive'],
                                  'fs_hz': s['fs'], 'window_samples': s['T']} for n, s in SYN_SPECS.items()},
-    'detection': {n: {'model': d['best'], 'cv_balanced_accuracy': d['cv']} for n, d in DET_MODELS.items()},
+    'detection': {n: {'model': d['best'], 'cv_balanced_accuracy': d['cv'], 'vehicle_detector_source': DET_SOURCE[n]}
+                  for n, d in DET_MODELS.items()},
     'diagnosis': {n: {'model': d['best'], 'classes': d['classes'], 'cv_balanced_accuracy': d['cv']} for n, d in DIAG_MODELS.items()},
     'rul': {n: {'model': d['best'], 'unit': d['unit'], 'n_features': len(d['feats'])} for n, d in RUL_MODELS.items()},
 }
@@ -1078,7 +1288,7 @@ reloaded = joblib.load(MODEL_DIR / 'ivhm_system.joblib')
 assert reloaded.assess(inputs)[1] == vehicle_status
 print('Saved', len(list(MODEL_DIR.glob('*.joblib'))), 'model files to', MODEL_DIR, '| reload check passed')
 
-# %% [39]
+# %% [43]
 def md_table(df):
     cols = list(df.columns)
     out = ['| ' + ' | '.join(map(str, cols)) + ' |', '|' + '---|' * len(cols)]
@@ -1095,7 +1305,7 @@ acc = acc[['subsystem', 'data_type', 'task', 'model', 'split', 'metric', 'value'
 err = held[held.metric.isin(['rmse', 'mae', 'r2', 'rmse_ah', 'nasa_score', 'macro_f1', 'roc_auc'])][
     ['subsystem', 'data_type', 'task', 'model', 'split', 'metric', 'value']].sort_values(['data_type', 'subsystem', 'task', 'metric'])
 
-head = headline[['subsystem', 'data_type', 'task', 'metric', 'value']].copy()
+head = headline[['subsystem', 'data_type', 'task', 'model', 'metric', 'value']].copy()
 head['meets_85pct'] = np.where(head.value >= ACC_TARGET, 'YES', 'no')
 by_type = {dt: f'{int((d.value >= ACC_TARGET).sum())}/{len(d)}' for dt, d in head.groupby('data_type')}
 below = head[head.value < ACC_TARGET]
@@ -1148,13 +1358,15 @@ lines = [
     '* Battery RUL rests on very few cells (leave-one-battery-out over the cells that reach 1.4 Ah); treat it as a feasibility result.',
     '* Hydraulic rig cycles are correlated in time; block-grouped splits reduce, but do not remove, optimism.',
     '* RUL accuracy figures depend on the stated state thresholds and tolerances; RMSE/MAE are reported alongside.',
+    '* The C-MAPSS 1D-CNN uses one validation split for early stopping; its score varies more between seeds than the tree models (use run_seeds.sh).',
+    '* Single-run scores near 85 % are not decisive; compare mean and spread over seeds (aggregate_seeds.py).',
     '* Next step: validate on DRDO/ADE flight logs or rig data, calibrate simulator constants against it, and re-run this notebook unchanged with the real tables.',
 ]
 report_path = OUT_DIR / 'IVHM_Test_and_Analysis_Report.md'
 report_path.write_text('\n'.join(lines), encoding='utf-8')
 print('\n'.join(lines))
 
-# %% [40]
+# %% [44]
 import shutil
 archive = shutil.make_archive(str(BASE_DIR / 'ivhm_outputs'), 'zip', OUT_DIR)
 print('Outputs archived to', archive, f'({Path(archive).stat().st_size / 1e6:.1f} MB)')

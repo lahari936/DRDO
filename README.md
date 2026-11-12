@@ -12,6 +12,7 @@ Everything runs in **one Google Colab notebook on the free CPU runtime**. It use
 |---|---|
 | `IVHM_UAV_Colab.ipynb` | The notebook. It has 13 sections, from environment setup through to the final report. |
 | `ivhm_pipeline.py` | The same pipeline as one plain Python script, for servers and GPU machines without Jupyter |
+| `run_seeds.sh` / `aggregate_seeds.py` | Run the pipeline with several seeds and report mean ± spread per metric |
 | `requirements.txt` | Versions for running outside Colab (Colab already has all of them) |
 
 ## How to run (Google Colab, recommended)
@@ -31,7 +32,7 @@ then use Run all. This mode shrinks only the synthetic fleet. Its scores are noi
 If a download fails (for example the NASA S3 bucket is temporarily unreachable), the notebook prints that dataset as unavailable, skips its tasks and marks them **NOT RUN** in the report. It never fills in numbers. Running it again later picks up any files already cached.
 
 ### GPU runtime
-A Colab GPU runtime (**Runtime > Change runtime type > T4 GPU**) works with no changes. The models are scikit-learn, though, so they run on the CPU cores either way, and a GPU gives no speed-up. Choosing a GPU runtime only uses up your Colab GPU quota.
+A Colab GPU runtime (**Runtime > Change runtime type > T4 GPU**) works with no changes. Only the C-MAPSS 1D-CNN uses the GPU, through PyTorch, which is pre-installed on Colab. Everything else is scikit-learn on the CPU. Without a GPU the CNN trains on the CPU in a few minutes. Without PyTorch that one model is skipped and marked NOT RUN.
 
 ## How to run on a workstation, server or GPU machine
 
@@ -59,6 +60,12 @@ Option B, execute the notebook so the outputs are saved inside it:
 ```bash
 pip install jupyter && jupyter nbconvert --to notebook --execute IVHM_UAV_Colab.ipynb --output IVHM_executed.ipynb --ExecutePreprocessor.timeout=3600
 ```
+
+Option C, five seeds with mean ± spread. This takes about 5× one run and writes to `runs/`. Use it before quoting any number near 85 %:
+```bash
+bash run_seeds.sh
+```
+On Colab, run `!git clone https://github.com/lahari936/DRDO.git && cd DRDO && bash run_seeds.sh` in a cell.
 
 Outputs go to `./ivhm_outputs/` (models, figures, `all_results.csv`, `IVHM_Test_and_Analysis_Report.md`) and the downloaded data to `./ivhm_data/`. You can override these with the environment variables `IVHM_OUT_DIR` and `IVHM_DATA_DIR`. Set `IVHM_QUICK=1` for the short smoke test.
 
@@ -110,6 +117,12 @@ No public, labelled UAV fault dataset exists for seven of the nine subsystems, s
 * **Features:** for each sensor and window, 12 statistical and spectral features (mean, std, min, max, RMS, skew, kurtosis, slope, peak-to-peak, diff-std, dominant frequency, spectral centroid). Battery features come from only the first 1000 s of each discharge. RUL tables add causal rolling means and unit age.
 * **Detection and diagnosis:** logistic regression, random forest and histogram gradient boosting compete. The winner is picked by GroupKFold cross-validation on training units only. An Isolation Forest trained on healthy data only serves as the unsupervised baseline.
 * **RUL:** Ridge, random forest and histogram gradient boosting, plus an MLP for C-MAPSS. The target uses a piecewise-linear cap. Batteries use nested leave-one-battery-out evaluation.
+* **Round-2 additions:**
+  * Detection can come from the diagnosis model, as P(fault) = 1 − P(normal). The notebook keeps it only when it beats the binary detector in training cross-validation.
+  * Hydraulic cycles get per-segment features, because the accumulator signature sits in pressure transients.
+  * Actuators get physics features: per-window least-squares identification of inertia, viscous and Coulomb friction, and hinge-load coefficients, plus servo tracking error.
+  * An extended battery RUL test runs leave-one-cell-out over every NASA cell that loses 30 % of its capacity.
+  * A PyTorch 1D-CNN models C-MAPSS over 30-cycle windows.
 * **Integration:** `IVHMSystem` registers every subsystem model and returns a per-subsystem table and a vehicle status.
 
 ### Leakage controls
@@ -136,5 +149,5 @@ This repository publishes **no accuracy numbers**. Every figure comes from your 
 * The real data is not from UAVs. The hydraulic set comes from an industrial test rig and the battery set from lab-cycled 18650 cells. C-MAPSS simulates a large turbofan.
 * Battery RUL is based on only the three cells that reach the 1.4 Ah end-of-life threshold (B0007 never reaches it), so treat it as a feasibility result.
 * Hydraulic rig cycles are correlated in time. Block-grouped splits reduce that optimism but don't remove it.
-* No raw-signal deep learning (CNN/LSTM) is used, which keeps the notebook CPU-friendly. Adding it is an upgrade path if GPU time becomes available.
+* Deep learning is used only for C-MAPSS, where enough run-to-failure trajectories exist. The other datasets are too small to justify it.
 * External links can change. If one does, update the `url` field in `REAL_DATASETS` (Section 2).
