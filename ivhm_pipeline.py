@@ -88,8 +88,6 @@ HYD_SENSORS = {'PS1': 100, 'PS2': 100, 'PS3': 100, 'PS4': 100, 'PS5': 100, 'PS6'
                'FS1': 10, 'FS2': 10, 'TS1': 1, 'TS2': 1, 'TS3': 1, 'TS4': 1, 'VS1': 1,
                'CE': 1, 'CP': 1, 'SE': 1}          # sensor -> sampling rate (Hz), from UCI documentation
 BATTERIES = ['B0005', 'B0006', 'B0007', 'B0018']
-# Other NASA cells in the same archive (different load profiles / temperatures), used for an extended RUL test
-BATTERIES_EXTRA = [f'B{n:04d}' for n in list(range(25, 35)) + [36] + list(range(38, 57))]
 
 REAL_DATASETS = {
     'cmapss': {
@@ -100,7 +98,6 @@ REAL_DATASETS = {
     'battery': {
         'url': 'https://phm-datasets.s3.amazonaws.com/NASA/5.+Battery+Data+Set.zip',
         'file': 'battery.zip', 'wanted': [f'{b}.mat' for b in BATTERIES],
-        'optional': [f'{b}.mat' for b in BATTERIES_EXTRA],
         'data_type': 'REAL',
         'source': 'NASA PCoE Li-ion 18650 aging tests B0005/6/7/18 (Saha & Goebel, 2007)'},
     'hydraulic': {
@@ -212,16 +209,7 @@ def load_nasa_battery(path):
 if DATA_OK['battery']:
     bat_cycles = [c for b in BATTERIES for c in load_nasa_battery(DATA_FILES['battery'][f'{b}.mat'])]
     print('Battery discharge cycles loaded:', pd.Series([c['battery'] for c in bat_cycles]).value_counts().to_dict())
-    bat_cycles_extra = []
-    for b in BATTERIES_EXTRA:
-        p = DATA_FILES['battery'].get(f'{b}.mat')
-        if p is None:
-            continue
-        try:
-            bat_cycles_extra += load_nasa_battery(p)
-        except Exception as e:
-            print(f'  {b}: skipped ({type(e).__name__}: {e})')
-    print('Extra NASA cells loaded:', len({c['battery'] for c in bat_cycles_extra}), 'cells,', len(bat_cycles_extra), 'discharge cycles')
+
 
 # ---- Load UCI hydraulic rig (REAL)
 if DATA_OK['hydraulic']:
@@ -559,13 +547,10 @@ if DATA_OK['battery']:
     def valid_cycle(c):
         return (c['t'].size > 10 and c['t'].max() >= PARTIAL_T and 0.5 < c['capacity_ah'] < 2.5
                 and np.all(np.isfinite(c['v'])) and np.all(np.isfinite(c['temp'])) and np.all(np.diff(c['t']) > 0))
-    n0, n0x = len(bat_cycles), len(bat_cycles_extra)
+    n0 = len(bat_cycles)
     bat_cycles = [c for c in bat_cycles if valid_cycle(c)]
-    bat_cycles_extra = [c for c in bat_cycles_extra if valid_cycle(c)]
     clean_log.append({'dataset': 'nasa_battery', 'type': 'REAL', 'values_repaired': 0, 'remaining_nan': 0,
                       'records_dropped': n0 - len(bat_cycles)})
-    clean_log.append({'dataset': 'nasa_battery_extra', 'type': 'REAL', 'values_repaired': 0, 'remaining_nan': 0,
-                      'records_dropped': n0x - len(bat_cycles_extra)})
 
 if DATA_OK['cmapss']:
     sensor_cols = [f's{i}' for i in range(1, 22)]
@@ -641,22 +626,65 @@ def actuator_physics_features(X, fs):
               'phys__track_err_absmax': np.abs(err).max(1), 'phys__reversal_err': np.nanmean(rev_err, axis=1)})
     return f
 
+def _slope(x, fs):
+    t = np.arange(x.shape[1]) / fs; tc = t - t.mean()
+    return ((x - x.mean(1, keepdims=True)) * tc).sum(1) / (tc ** 2).sum()
+
+def fuel_physics_features(X, fs):
+    # Standard fuel-system condition indicators: flow-corrected filter resistance (dP / Q^2), pump head per amp,
+    # and the mass-balance mismatch between tank-level drop and metered flow (leak / flow-meter drift).
+    p, q, dp, level, cur = (X[:, :, j].astype(np.float64) for j in range(5))
+    qm = np.clip(q.mean(1), 1.0, None)
+    level_rate_lph = -_slope(level, fs) * 3600 * 50 / 100        # %/s -> L/h for the 50 L tank
+    return {'phys__filter_resistance': dp.mean(1) / qm ** 2, 'phys__pump_head_per_amp': p.mean(1) / cur.mean(1),
+            'phys__massbalance_mismatch_lph': level_rate_lph - qm}
+
+def electronics_physics_features(X, fs):
+    # Standard power-electronics indicators: DC-link ESR estimate (ripple / current), case-to-board temperature rise
+    # per I^2 (proportional to on-resistance x thermal resistance) and on-resistance corrected to 25 C using a
+    # typical datasheet coefficient of +0.5 %/K.
+    case, rds, ripple, board, i_sup = (X[:, :, j].astype(np.float64) for j in range(5))
+    i2 = np.clip((i_sup ** 2).mean(1), 1e-3, None)
+    return {'phys__esr_est': ripple.mean(1) / np.clip(i_sup.mean(1), 1e-3, None),
+            'phys__thermal_index': (case - board).mean(1) / i2,
+            'phys__rds_on_25c': rds.mean(1) / (1 + 0.005 * (case.mean(1) - 25))}
+
+def prognostic_features(df, group_col, cols, w_short=5, w_long=15, n_base=10, lag=10):
+    # Causal health-indicator features computed within each unit from past and present flights only:
+    # short/long rolling means, drift from the unit's own early-life baseline (mean of its first n_base flights;
+    # an expanding mean before that), and the change of the short rolling mean over the last `lag` flights
+    # (degradation rate). Baseline drift removes unit-to-unit manufacturing spread; the rate term captures how fast
+    # each unit is degrading, which a single-flight snapshot cannot.
+    grp = df[group_col].to_numpy()
+    short = causal_rolling(df, group_col, cols, w_short)
+    long_ = causal_rolling(df, group_col, cols, w_long)
+    pos = df.groupby(group_col).cumcount().to_numpy()
+    base = df.groupby(group_col)[cols].expanding().mean().reset_index(level=0, drop=True).sort_index()
+    base.loc[pos >= n_base] = np.nan
+    base = base.groupby(grp).ffill()
+    drift = pd.DataFrame(short.to_numpy() - base.to_numpy(), index=df.index, columns=[f'{c}_drift' for c in cols])
+    rate = (short - short.groupby(grp).shift(lag)).fillna(0.0).add_suffix('_rate')
+    return pd.concat([short, long_, drift, rate], axis=1)
+
+PHYSICS_FEATURES = {'actuators': actuator_physics_features, 'fuel': fuel_physics_features,
+                    'electronics': electronics_physics_features}
+
 # ---- Synthetic fault tables and run-to-failure tables
 FAULT_TASKS, RTF_TABLES, RTF_FEATS = {}, {}, {}
 for name, sp in SYN_SPECS.items():
     fr = syn_fault_raw[name]
     Xf = tensor_features(fr['X'], sp['sensors'], sp['fs'])
-    if name == 'actuators':
-        Xf = pd.concat([Xf, pd.DataFrame(actuator_physics_features(fr['X'], sp['fs']))], axis=1)
+    if name in PHYSICS_FEATURES:
+        Xf = pd.concat([Xf, pd.DataFrame(PHYSICS_FEATURES[name](fr['X'], sp['fs']))], axis=1)
     FAULT_TASKS[name] = {'X': Xf, 'y': fr['label'], 'groups': fr['unit'], 'classes': ['normal'] + sp['faults'],
                          'nominal': 'normal', 'data_type': 'SYNTHETIC'}
     rr = syn_rtf_raw[name]
     base = tensor_features(rr['X'], sp['sensors'], sp['fs'])
-    if name == 'actuators':
-        base = pd.concat([base, pd.DataFrame(actuator_physics_features(rr['X'], sp['fs']))], axis=1)
+    if name in PHYSICS_FEATURES:
+        base = pd.concat([base, pd.DataFrame(PHYSICS_FEATURES[name](rr['X'], sp['fs']))], axis=1)
     meta = pd.DataFrame({'unit': rr['unit'], 'age': rr['cycle'], 'rul': rr['rul']})
     tab = pd.concat([meta, base], axis=1)
-    tab = pd.concat([tab, causal_rolling(tab, 'unit', list(base.columns), 5)], axis=1)
+    tab = pd.concat([tab, prognostic_features(tab, 'unit', list(base.columns))], axis=1)
     RTF_TABLES[name] = tab
     RTF_FEATS[name] = [c for c in tab.columns if c not in ('unit', 'rul')]
     fr['X'] = rr['X'] = None          # free raw tensors
@@ -674,7 +702,14 @@ if DATA_OK['hydraulic']:
         for k, s in enumerate(np.array_split(x.astype(np.float64), n_seg, axis=1)):
             f[f'{prefix}__seg{k}_mean'] = s.mean(1); f[f'{prefix}__seg{k}_std'] = s.std(1)
         return f
-    hyd_X = pd.concat([pd.DataFrame(window_features(hyd_raw[s], fs, s) | segment_features(hyd_raw[s], 6, s))
+    def profile_features(x, n_pts, prefix):
+        # Cycle-synchronous profile: the 60 s cycle averaged into n_pts consecutive bins (2 s each for n_pts=30).
+        # Every rig cycle runs the same load programme, so bin k is comparable across cycles.
+        prof = x.astype(np.float64).reshape(len(x), n_pts, -1).mean(2)
+        return {f'{prefix}__prof{k:02d}': prof[:, k] for k in range(n_pts)}
+    PROFILE_SENSORS = ['PS1', 'PS2', 'PS3', 'PS4', 'PS5', 'PS6', 'EPS1', 'FS1', 'FS2']
+    hyd_X = pd.concat([pd.DataFrame(window_features(hyd_raw[s], fs, s) | segment_features(hyd_raw[s], 6, s)
+                                    | (profile_features(hyd_raw[s], 30, s) if s in PROFILE_SENSORS else {}))
                        for s, fs in HYD_SENSORS.items()], axis=1)
     hyd_any_fault = np.zeros(len(hyd_profile), int)
     for comp, is_crit in HYD_CRITICAL.items():
@@ -1041,6 +1076,21 @@ if DATA_OK['battery']:
     record('li_ion_battery', 'REAL', 'soh', 'nested-LOBO', 'soh_accuracy', 1 - np.mean(np.abs(yp - yt) / yt), split='lobo')
     record('li_ion_battery', 'REAL', 'soh', 'nested-LOBO', 'r2', r2_score(yt, yp), split='lobo')
 
+    # RUL is predicted at the end of each completed discharge, so the capacities measured on that and all earlier
+    # discharges are known (standard NASA-battery prognostics setting). Only past/current values are used.
+    def _trend(w):
+        return np.polyfit(np.arange(len(w)), w, 1)[0]
+    g = bat_tab.groupby('battery').capacity_ah
+    bat_tab['cap_now'] = bat_tab.capacity_ah
+    bat_tab['cap_mean5'] = g.transform(lambda s: s.rolling(5, min_periods=1).mean())
+    bat_tab['cap_slope15'] = g.transform(lambda s: s.rolling(15, min_periods=3).apply(_trend, raw=True)).fillna(0.0)
+    bat_tab['cap_max_sofar'] = g.cummax()
+    bat_tab['cap_margin'] = bat_tab.cap_mean5 - EOL_AH
+    bat_tab['cycles_to_eol_trend'] = np.where(bat_tab.cap_slope15 < -1e-4,
+                                              bat_tab.cap_margin / -bat_tab.cap_slope15, 300.0).clip(0, 300)
+    CAP_HIST = ['cap_now', 'cap_mean5', 'cap_slope15', 'cap_max_sofar', 'cap_margin', 'cycles_to_eol_trend']
+    BAT_RUL_FEATS = BAT_FEATS + ['age'] + CAP_HIST
+
     # RUL: only batteries whose measured capacity crosses the EOL threshold have a defined RUL
     eol = {b: d.loc[d.capacity_ah < EOL_AH, 'age'].min() for b, d in bat_tab.groupby('battery')}
     rul_bats = [b for b in BATTERIES if pd.notna(eol[b])]
@@ -1052,9 +1102,9 @@ if DATA_OK['battery']:
     if len(rul_bats) >= 3:
         for held in rul_bats:
             tr = (rt.battery != held).to_numpy(); te = ~tr
-            best, model, _ = select_and_fit(reg_candidates(), rt.loc[tr, BAT_FEATS + ['age']], rt.rul[tr],
+            best, model, _ = select_and_fit(reg_candidates(), rt.loc[tr, BAT_RUL_FEATS], rt.rul[tr],
                                             rt.battery[tr].to_numpy(), 'neg_root_mean_squared_error')
-            pred = np.clip(model.predict(rt.loc[te, BAT_FEATS + ['age']]), 0, None)
+            pred = np.clip(model.predict(rt.loc[te, BAT_RUL_FEATS]), 0, None)
             BAT_FOLD_MODELS[held] = model
             bat_rul_pred[held] = (rt.age[te].to_numpy(), rt.rul[te].to_numpy(float), pred)
             m = rul_metrics(rt.rul[te].to_numpy(float), pred, TOL_BAT, CRIT_BAT, WARN_BAT)
@@ -1063,9 +1113,9 @@ if DATA_OK['battery']:
         yt = np.concatenate([v[1] for v in bat_rul_pred.values()]); yp = np.concatenate([v[2] for v in bat_rul_pred.values()])
         for k, v in rul_metrics(yt, yp, TOL_BAT, CRIT_BAT, WARN_BAT).items():
             record('li_ion_battery', 'REAL', 'rul', 'nested-LOBO', k, v, split='lobo')
-        final_best, bat_final, _ = select_and_fit(reg_candidates(), rt[BAT_FEATS + ['age']], rt.rul, rt.battery.to_numpy(),
+        final_best, bat_final, _ = select_and_fit(reg_candidates(), rt[BAT_RUL_FEATS], rt.rul, rt.battery.to_numpy(),
                                                   'neg_root_mean_squared_error')
-        RUL_MODELS['li_ion_battery'] = {'model': bat_final, 'best': final_best, 'feats': BAT_FEATS + ['age'], 'unit': 'cycles', 'crit': CRIT_BAT}
+        RUL_MODELS['li_ion_battery'] = {'model': bat_final, 'best': final_best, 'feats': BAT_RUL_FEATS, 'unit': 'cycles', 'crit': CRIT_BAT}
     else:
         print('Fewer than 3 batteries reach EOL: battery RUL NOT RUN (cannot do nested leave-one-out).')
     print(f'Battery modelling took {time.time() - t0:.0f} s')
@@ -1082,40 +1132,7 @@ if DATA_OK['battery']:
 else:
     print('Battery data not available: SOH/RUL NOT RUN')
 
-# %% [32]
-# ---- Extended battery RUL (REAL): every NASA cell that loses 30 % of its initial capacity
-# Cells differ in load current, cut-off voltage and ambient temperature, so this is a harder generalisation test
-# than the 4-cell result above. EOL = first cycle where the 3-cycle rolling median of capacity < 70 % of initial.
-if DATA_OK['battery'] and bat_cycles_extra:
-    t0 = time.time()
-    ext = pd.DataFrame([{'battery': c['battery'], 'age': c['discharge_idx'], 'capacity_ah': c['capacity_ah']} | battery_features(c)
-                        for c in bat_cycles + bat_cycles_extra]).reset_index(drop=True)
-    ext = pd.concat([ext, causal_rolling(ext, 'battery', BAT_BASE, 5)], axis=1)
-    frac = ext.capacity_ah / ext.groupby('battery').capacity_ah.transform(lambda s: s.iloc[:3].mean())
-    ext['cap_frac_med3'] = frac.groupby(ext.battery).transform(lambda s: s.rolling(3, min_periods=1).median())
-    eol_ext = {b: d.loc[d.cap_frac_med3 < 0.7, 'age'].min() for b, d in ext.groupby('battery')}
-    elig = sorted(b for b, e in eol_ext.items() if pd.notna(e) and e >= 20)
-    print(f'{ext.battery.nunique()} cells with valid cycles; {len(elig)} reach 70 % capacity after >= 20 cycles:', elig)
-    if len(elig) >= 4:
-        xt = ext[ext.battery.isin(elig)].copy()
-        xt['rul'] = xt.battery.map(eol_ext) - xt.age
-        xt = xt[xt.rul >= 0]
-        yt_all, yp_all = [], []
-        for held_b in elig:
-            tr = (xt.battery != held_b).to_numpy(); te = ~tr
-            best, model, _ = select_and_fit(reg_candidates(), xt.loc[tr, BAT_FEATS + ['age']], xt.rul[tr],
-                                            xt.battery[tr].to_numpy(), 'neg_root_mean_squared_error')
-            yt_all.append(xt.rul[te].to_numpy(float)); yp_all.append(np.clip(model.predict(xt.loc[te, BAT_FEATS + ['age']]), 0, None))
-        yt_e, yp_e = np.concatenate(yt_all), np.concatenate(yp_all)
-        for k, v in rul_metrics(yt_e, yp_e, TOL_BAT, CRIT_BAT, WARN_BAT).items():
-            record('li_ion_battery', 'REAL', 'rul_extended', 'nested-LOBO', k, v, split='lobo')
-        m = rul_metrics(yt_e, yp_e, TOL_BAT, CRIT_BAT, WARN_BAT)
-        print(f'Extended LOBO over {len(elig)} cells: RMSE={m["rmse"]:.1f} cycles, state_acc={m["state_accuracy"]:.3f}, '
-              f'tol_acc={m["tolerance_accuracy"]:.3f} ({time.time() - t0:.0f} s)')
-    else:
-        print('Fewer than 4 eligible cells: extended battery RUL NOT RUN')
-
-# %% [34]
+# %% [33]
 class IVHMSystem:
     STATUS_ORDER = {'NORMAL': 0, 'CAUTION': 1, 'CRITICAL': 2}
 
@@ -1169,7 +1186,7 @@ if DATA_OK['hydraulic']:
         ivhm.register(f'hydraulic:{comp}', 'REAL', diagnoser=d['model'], classes=d['classes'], nominal=d['nominal'])
 if 'li_ion_battery' in RUL_MODELS:
     demo_bat = list(BAT_FOLD_MODELS)[-1]      # model trained without this battery, demo sample taken from it
-    ivhm.register('li_ion_battery', 'REAL', rul_model=BAT_FOLD_MODELS[demo_bat], rul_feats=BAT_FEATS + ['age'],
+    ivhm.register('li_ion_battery', 'REAL', rul_model=BAT_FOLD_MODELS[demo_bat], rul_feats=BAT_RUL_FEATS,
                   rul_unit='cycles', rul_crit=CRIT_BAT)
 if 'propulsion_cmapss' in RUL_MODELS:
     ivhm.register('propulsion_cmapss', 'SIMULATED-BENCHMARK', rul_model=cm_model, rul_feats=CM_FEATS, rul_unit='cycles', rul_crit=CRIT_CM)
@@ -1206,7 +1223,7 @@ pd.set_option('display.width', 200)
 print(vehicle_report.round(3).to_string(index=False))
 print('\nVEHICLE STATUS:', vehicle_status)
 
-# %% [36]
+# %% [35]
 res = pd.DataFrame(RESULTS)
 ACC_METRICS = ['accuracy', 'balanced_accuracy', 'state_accuracy', 'tolerance_accuracy', 'soh_accuracy']
 
@@ -1221,7 +1238,7 @@ summary = held[held.metric.isin(ACC_METRICS + ['macro_f1', 'roc_auc', 'rmse', 'm
 print('\nHeld-out results:')
 print(summary.to_string())
 
-# %% [37]
+# %% [36]
 headline = held[((held.task.isin(['detection_selected', 'diagnosis'])) & (held.metric == 'balanced_accuracy')) |
                 ((held.task.isin(['rul', 'rul_extended'])) & (held.metric == 'state_accuracy') & (held.split != 'test_all_cycles')) |
                 ((held.task == 'soh') & (held.metric == 'soh_accuracy'))].copy()
@@ -1243,7 +1260,7 @@ det_cmp.plot.bar(figsize=(12, 4), title='Supervised vs unsupervised (Isolation F
 plt.axhline(ACC_TARGET, c='r', ls='--'); plt.ylim(0, 1.05)
 savefig('summary_detection_supervised_vs_unsupervised')
 
-# %% [39]
+# %% [38]
 imp_names = [n for n in DIAG_MODELS]
 cols = 3; rows = int(np.ceil(len(imp_names) / cols))
 fig, axes = plt.subplots(rows, cols, figsize=(6.5 * cols, 3.3 * rows))
@@ -1261,7 +1278,7 @@ for a, name in zip(axes.ravel(), imp_names):
     a.tick_params(axis='y', labelsize=7)
 savefig('diagnosis_permutation_importance')
 
-# %% [41]
+# %% [40]
 for name, d in DET_MODELS.items():
     joblib.dump({'model': d['model'], 'iso': d['iso'], 'iso_thr': d['iso_thr']}, MODEL_DIR / f'detect_{name.replace(":", "_")}.joblib')
 for name, d in DIAG_MODELS.items():
@@ -1288,7 +1305,7 @@ reloaded = joblib.load(MODEL_DIR / 'ivhm_system.joblib')
 assert reloaded.assess(inputs)[1] == vehicle_status
 print('Saved', len(list(MODEL_DIR.glob('*.joblib'))), 'model files to', MODEL_DIR, '| reload check passed')
 
-# %% [43]
+# %% [42]
 def md_table(df):
     cols = list(df.columns)
     out = ['| ' + ' | '.join(map(str, cols)) + ' |', '|' + '---|' * len(cols)]
@@ -1366,7 +1383,7 @@ report_path = OUT_DIR / 'IVHM_Test_and_Analysis_Report.md'
 report_path.write_text('\n'.join(lines), encoding='utf-8')
 print('\n'.join(lines))
 
-# %% [44]
+# %% [43]
 import shutil
 archive = shutil.make_archive(str(BASE_DIR / 'ivhm_outputs'), 'zip', OUT_DIR)
 print('Outputs archived to', archive, f'({Path(archive).stat().st_size / 1e6:.1f} MB)')

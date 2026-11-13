@@ -13,6 +13,15 @@ Everything runs in **one Google Colab notebook on the free CPU runtime**. It use
 | `IVHM_UAV_Colab.ipynb` | The notebook. It has 13 sections, from environment setup through to the final report. |
 | `ivhm_pipeline.py` | The same pipeline as one plain Python script, for servers and GPU machines without Jupyter |
 | `run_seeds.sh` / `aggregate_seeds.py` | Run the pipeline with several seeds and report mean ± spread per metric |
+| `make_submission.py` | Builds `submission/` and `IVHM_submission.zip`: the final results summary, models, figures, reports and code |
+| `docs/IVHM_Technical_Report.md` | Technical report: architecture, data, features, algorithms, evaluation protocol, limitations |
+
+## Producing the submission package (one command)
+
+```bash
+bash run_seeds.sh
+```
+This runs 5 seeds, aggregates them, and builds the package. The result is `IVHM_submission.zip`, holding `Results_Summary.md` (mean ± std, worst seed, and pass/fail against 85 %), the technical report, the trained models, figures, per-seed test reports, the notebook and the script. Every number is generated from the runs; none is typed by hand.
 | `requirements.txt` | Versions for running outside Colab (Colab already has all of them) |
 
 ## How to run (Google Colab, recommended)
@@ -121,8 +130,12 @@ No public, labelled UAV fault dataset exists for seven of the nine subsystems, s
   * Detection can come from the diagnosis model, as P(fault) = 1 − P(normal). The notebook keeps it only when it beats the binary detector in training cross-validation.
   * Hydraulic cycles get per-segment features, because the accumulator signature sits in pressure transients.
   * Actuators get physics features: per-window least-squares identification of inertia, viscous and Coulomb friction, and hinge-load coefficients, plus servo tracking error.
-  * An extended battery RUL test runs leave-one-cell-out over every NASA cell that loses 30 % of its capacity.
   * A PyTorch 1D-CNN models C-MAPSS over 30-cycle windows.
+* **Round-3 additions:**
+  * Hydraulic cycles get a 30-bin profile of the pressure, flow and power sensors, aimed at the accumulator.
+  * Battery RUL uses the capacity history up to the current discharge, plus a trend-extrapolated time to EOL.
+  * All synthetic RUL models get causal prognostic features: drift from each unit's own baseline and the 10-flight degradation rate.
+  * Fuel and electronics get physics health indicators: flow-corrected filter resistance, mass-balance mismatch, ESR, and temperature-corrected on-resistance.
 * **Integration:** `IVHMSystem` registers every subsystem model and returns a per-subsystem table and a vehicle status.
 
 ### Leakage controls

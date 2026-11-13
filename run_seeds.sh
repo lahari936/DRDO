@@ -12,3 +12,4 @@ for s in $SEEDS; do
   tail -n 1 "runs/seed_$s.log"
 done
 python aggregate_seeds.py runs
+python make_submission.py runs
