@@ -22,8 +22,9 @@ import pandas as pd
 
 SEED_ENV = int(os.environ.get('IVHM_SEED', '1'))
 os.environ['IVHM_SEED'] = str(SEED_ENV)
-os.environ.setdefault('IVHM_OUT_DIR', f'runs_robustness/seed_{SEED_ENV}')
-OUT = Path(__file__).with_name('robustness'); OUT.mkdir(exist_ok=True)
+DR = os.environ.get('IVHM_DOMAIN_RAND', '1') == '1'      # train with domain-randomised synthetic fleets
+os.environ.setdefault('IVHM_OUT_DIR', f'runs_robustness{"_dr" if DR else ""}/seed_{SEED_ENV}')
+OUT = Path(__file__).with_name('robustness_dr' if DR else 'robustness'); OUT.mkdir(exist_ok=True)
 
 import matplotlib
 matplotlib.use('Agg')
@@ -39,6 +40,7 @@ for c in cells[:stop + 1]:
     exec(compile(c, 'ivhm_pipeline', 'exec'), g)
 print(f'pipeline cells executed in {time.time() - t0:.0f} s', flush=True)
 
+g['DOMAIN_RAND'], g['NOISE_K'] = False, 1.0     # test scenarios set noise / tolerance explicitly below
 SYN, meas_orig = g['SYN_SPECS'], g['meas']
 rng_master = np.random.default_rng(SEED_ENV + 1000)          # fresh vehicles, never used in training or testing
 

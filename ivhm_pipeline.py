@@ -47,6 +47,9 @@ warnings.filterwarnings('ignore', category=ConvergenceWarning)
 
 IN_COLAB = 'google.colab' in sys.modules
 SEED = int(os.environ.get('IVHM_SEED', '42'))   # set IVHM_SEED for repeated runs (run_seeds.sh)
+# Domain randomisation of the synthetic fleets: per-window sensor-noise scale U(1, 2.5), per-vehicle tolerance
+# U(3 %, 8 %) and dropout rate U(0.3 %, 1.5 %), so models do not latch onto one simulator noise level.
+DOMAIN_RAND = os.environ.get('IVHM_DOMAIN_RAND', '1') == '1'   # default on; set 0 to reproduce round 4
 np.random.seed(SEED)
 QUICK_MODE = os.environ.get('IVHM_QUICK', '0') == '1'   # smaller synthetic fleet for a fast smoke test
 
@@ -233,8 +236,10 @@ def mission_load(n, T, fs, rng):
     L = base + 0.12 * np.sin(2 * np.pi * f * t + ph) + 0.02 * rng.standard_normal((n, T))
     return t, np.clip(L, 0.05, 1.0)
 
+NOISE_K = 1.0          # sensor-noise multiplier; set per window by simulate() when DOMAIN_RAND is on
+
 def meas(x, sigma, rng):
-    return x + sigma * rng.standard_normal(x.shape)
+    return x + sigma * NOISE_K * rng.standard_normal(x.shape)
 
 def sim_airframe(sev, uf, rng, T, fs):
     n = len(sev); t, L = mission_load(n, T, fs, rng)
@@ -410,10 +415,17 @@ SYN_SPECS = {
 
 # %% [10]
 def simulate(name, sev, uf, rng, chunk=1000):
+    global NOISE_K
     sp = SYN_SPECS[name]
-    X = np.concatenate([sp['fn'](sev[i:i + chunk], uf[i:i + chunk], rng, sp['T'], sp['fs']).astype(np.float32)
-                        for i in range(0, len(sev), chunk)])
-    X[rng.random(X.shape) < 0.003] = np.nan        # telemetry dropouts, repaired in Section 4
+    parts = []
+    for i in range(0, len(sev), chunk):
+        n_i = len(sev[i:i + chunk])
+        NOISE_K = rng.uniform(1.0, 2.5, (n_i, 1)) if DOMAIN_RAND else 1.0
+        parts.append(sp['fn'](sev[i:i + chunk], uf[i:i + chunk], rng, sp['T'], sp['fs']).astype(np.float32))
+    NOISE_K = 1.0
+    X = np.concatenate(parts)
+    drop = rng.uniform(0.003, 0.015, (len(X), 1, 1)) if DOMAIN_RAND else 0.003
+    X[rng.random(X.shape) < drop] = np.nan          # telemetry dropouts, repaired in Section 4
     return X
 
 def make_fault_dataset(name, n_units, win_per_unit, rng, p_normal=0.4):
@@ -421,7 +433,7 @@ def make_fault_dataset(name, n_units, win_per_unit, rng, p_normal=0.4):
     F = len(SYN_SPECS[name]['faults'])
     unit = np.repeat(np.arange(n_units), win_per_unit)
     n = len(unit)
-    uf = rng.normal(1.0, 0.04, (n_units, 4))[unit]
+    uf = (1.0 + rng.standard_normal((n_units, 4)) * (rng.uniform(0.03, 0.08, (n_units, 1)) if DOMAIN_RAND else 0.04))[unit]
     label = np.where(rng.random(n) < p_normal, 0, rng.integers(1, F + 1, n))
     severity = np.where(label > 0, rng.uniform(0.2, 1.0, n), 0.0)
     sev = np.zeros((n, F))
@@ -441,7 +453,7 @@ def make_rtf_dataset(name, n_units, rng, life_range=(80, 200)):
         units.append(np.full(life, u)); cycles.append(k); ruls.append(life - k); health.append(d)
     unit, cycle, rul, d = map(np.concatenate, (units, cycles, ruls, health))
     sev = np.zeros((len(unit), len(sp['faults']))); sev[:, pidx] = d
-    uf = rng.normal(1.0, 0.04, (n_units, 4))[unit]
+    uf = (1.0 + rng.standard_normal((n_units, 4)) * (rng.uniform(0.03, 0.08, (n_units, 1)) if DOMAIN_RAND else 0.04))[unit]
     return {'X': simulate(name, sev, uf, rng), 'unit': unit, 'cycle': cycle, 'rul': rul, 'damage': d}
 
 N_UNITS_FAULT, WIN_PER_UNIT, N_UNITS_RTF = (16, 20, 12) if QUICK_MODE else (48, 50, 40)
