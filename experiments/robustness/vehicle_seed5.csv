@@ -1,0 +1,2 @@
+seed,vehicle_status_accuracy,subsystem_status_accuracy,true_status_mix
+5,0.904,0.93475,"{'CRITICAL': 352, 'CAUTION': 148}"

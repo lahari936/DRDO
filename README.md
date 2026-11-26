@@ -164,3 +164,7 @@ This repository publishes **no accuracy numbers**. Every figure comes from your 
 * Hydraulic rig cycles are correlated in time. Block-grouped splits reduce that optimism but don't remove it.
 * Deep learning is used only for C-MAPSS, where enough run-to-failure trajectories exist. The other datasets are too small to justify it.
 * External links can change. If one does, update the `url` field in `REAL_DATASETS` (Section 2).
+
+## Research paper
+
+`paper/IVHM_Research_Paper.docx` is the IEEE-format paper, built on the BVRIT conference template. Rebuild it with `python paper/make_figures.py` (on a machine with the results), then `python paper/build_paper.py <template.docx> paper/IVHM_Research_Paper.docx`. All numbers in it are read from `results/final_5seeds/` and `experiments/`.

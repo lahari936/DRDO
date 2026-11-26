@@ -1,0 +1,10 @@
+,mean,std,min,max
+diagnosis_balanced_accuracy,0.7373,0.0175,0.7195,0.7584
+detection_balanced_accuracy,0.8349,0.0073,0.8236,0.8412
+false_alarm_rate_normal_windows,0.0974,0.0209,0.076,0.121
+median_detection_delay_s,1.7901,0.0451,1.7247,1.8329
+recall_normal,0.904,0.0211,0.8806,0.9256
+recall_engine,0.9851,0.003,0.9821,0.9881
+recall_aileron,0.5196,0.0274,0.4968,0.5538
+recall_rudder,0.6205,0.0115,0.6154,0.641
+recall_elevator,0.6571,0.0782,0.5714,0.7143

@@ -1,0 +1,23 @@
+{
+  "flights_per_type": {
+    "aileron": 7,
+    "elevator": 2,
+    "engine": 23,
+    "normal": 10,
+    "rudder": 3
+  },
+  "windows": 4488,
+  "windows_per_label": {
+    "normal": 3776,
+    "engine": 336,
+    "aileron": 316,
+    "rudder": 39,
+    "elevator": 21
+  },
+  "features": 110,
+  "model_choice_counts": {
+    "LogReg": 13,
+    "HistGB": 9,
+    "RandomForest": 3
+  }
+}

@@ -12,7 +12,20 @@ The full submission package (models, figures, per-seed reports, code) is attache
 
 ## Final headline (held-out data, mean of 5 seeds)
 
-33 of 35 headline rows reach 85 % on the mean: REAL 6/7, SIMULATED-BENCHMARK 1/2 (the 1D-CNN passes; the tree baseline does not), SYNTHETIC 24/24.
+31 of 33 headline rows reach 85 % on the mean: REAL 6/7, SIMULATED-BENCHMARK 1/2 (the 1D-CNN passes; the tree baseline does not), SYNTHETIC 24/24. Counting only the deployed C-MAPSS model (the 1D-CNN), that is 31 of 32. (An earlier version of this file said "33 of 35"; that was a counting error.)
+
+## Stress tests (`experiments/`, 5 seeds each)
+
+| Test | Result | Meets 85 %? |
+|---|---|---|
+| Real UAV flights, ALFA (45 flights, leave-flights-out): fault detection | 0.835 ± 0.007 balanced accuracy, 33–34 of 35 failure flights detected, median delay 1.8 s | no (close) |
+| ALFA 5-class diagnosis | 0.737 ± 0.018 (engine 0.985, aileron 0.520) | no |
+| Synthetic diagnosis, new vehicles with 2× manufacturing tolerance | 0.914 | yes |
+| Synthetic diagnosis, 2× sensor noise | 0.737 (RUL state accuracy holds at 0.856) | no |
+| Vehicle-level status, 500 virtual vehicles | 0.905 ± 0.017 | yes |
+| Inference, one CPU core | 0.5–32 ms per diagnosis model, 4–15 ms per RUL model | n/a |
+
+Scripts: `experiments/alfa_real_uav.py`, `experiments/robustness_and_deployment.py`; outputs in `experiments/alfa_results/` and `experiments/robustness/`.
 
 | Task | Round 2 | Round 3 | Final |
 |---|---|---|---|
