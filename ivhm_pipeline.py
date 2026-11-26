@@ -34,7 +34,7 @@ from sklearn.model_selection import GroupKFold, GroupShuffleSplit, cross_val_sco
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import make_pipeline
 from sklearn.linear_model import LogisticRegression, Ridge
-from sklearn.ensemble import (RandomForestClassifier, RandomForestRegressor,
+from sklearn.ensemble import (RandomForestClassifier, RandomForestRegressor, VotingClassifier,
                               HistGradientBoostingClassifier, HistGradientBoostingRegressor,
                               IsolationForest)
 from sklearn.neural_network import MLPRegressor
@@ -702,20 +702,19 @@ if DATA_OK['hydraulic']:
         for k, s in enumerate(np.array_split(x.astype(np.float64), n_seg, axis=1)):
             f[f'{prefix}__seg{k}_mean'] = s.mean(1); f[f'{prefix}__seg{k}_std'] = s.std(1)
         return f
-    def profile_features(x, n_pts, prefix):
-        # Cycle-synchronous profile: the 60 s cycle averaged into n_pts consecutive bins (2 s each for n_pts=30).
-        # Every rig cycle runs the same load programme, so bin k is comparable across cycles.
-        prof = x.astype(np.float64).reshape(len(x), n_pts, -1).mean(2)
-        return {f'{prefix}__prof{k:02d}': prof[:, k] for k in range(n_pts)}
-    PROFILE_SENSORS = ['PS1', 'PS2', 'PS3', 'PS4', 'PS5', 'PS6', 'EPS1', 'FS1', 'FS2']
-    hyd_X = pd.concat([pd.DataFrame(window_features(hyd_raw[s], fs, s) | segment_features(hyd_raw[s], 6, s)
-                                    | (profile_features(hyd_raw[s], 30, s) if s in PROFILE_SENSORS else {}))
+    hyd_X = pd.concat([pd.DataFrame(window_features(hyd_raw[s], fs, s) | segment_features(hyd_raw[s], 6, s))
                        for s, fs in HYD_SENSORS.items()], axis=1)
+    # Accumulator diagnosis and critical-fault detection use only the fast pressure / flow / motor-power sensors.
+    # Chosen by training-split cross-validation over 5 seeds (experiments/hydraulic_cv_experiment.py): the slow
+    # temperature, vibration and efficiency channels mostly track cooler state and ambient drift and add noise here.
+    PRESSURE_FLOW_POWER = ['PS1', 'PS2', 'PS3', 'PS4', 'PS5', 'PS6', 'EPS1', 'FS1', 'FS2']
+    HYD_PFP_COLS = [c for c in hyd_X.columns if c.split('__')[0] in PRESSURE_FLOW_POWER]
     hyd_any_fault = np.zeros(len(hyd_profile), int)
     for comp, is_crit in HYD_CRITICAL.items():
         hyd_any_fault |= is_crit(hyd_profile[comp].values).astype(int)
-    FAULT_TASKS['hydraulic'] = {'X': hyd_X, 'y': hyd_any_fault, 'groups': HYD_GROUPS,
-                                'classes': ['no_critical_fault', 'critical_fault'], 'nominal': 'no_critical_fault', 'data_type': 'REAL'}
+    FAULT_TASKS['hydraulic'] = {'X': hyd_X[HYD_PFP_COLS], 'y': hyd_any_fault, 'groups': HYD_GROUPS,
+                                'classes': ['no_critical_fault', 'critical_fault'], 'nominal': 'no_critical_fault',
+                                'data_type': 'REAL', 'soft_vote': True}
     del hyd_raw
     print('hydraulic features', hyd_X.shape, '| cycles with a critical fault:', int(hyd_any_fault.sum()), 'of', len(hyd_any_fault))
 
@@ -756,10 +755,13 @@ if DATA_OK['cmapss']:
     print('C-MAPSS train table', cm_tr_tab.shape, '| test table', cm_te_tab.shape)
 
 # %% [21]
-def clf_candidates():
-    return {'LogReg': make_pipeline(StandardScaler(), LogisticRegression(max_iter=3000)),
-            'RandomForest': RandomForestClassifier(n_estimators=200, min_samples_leaf=2, n_jobs=-1, random_state=SEED),
-            'HistGB': HistGradientBoostingClassifier(max_iter=200, learning_rate=0.1, early_stopping=False, random_state=SEED)}
+def clf_candidates(soft_vote=False):
+    c = {'LogReg': make_pipeline(StandardScaler(), LogisticRegression(max_iter=3000)),
+         'RandomForest': RandomForestClassifier(n_estimators=200, min_samples_leaf=2, n_jobs=-1, random_state=SEED),
+         'HistGB': HistGradientBoostingClassifier(max_iter=200, learning_rate=0.1, early_stopping=False, random_state=SEED)}
+    if soft_vote:   # averaged class probabilities of the three models; still chosen only if it wins training CV
+        c['SoftVote'] = VotingClassifier([(k.lower(), clone(m)) for k, m in c.items()], voting='soft')
+    return c
 
 def reg_candidates(with_mlp=False):
     c = {'Ridge': make_pipeline(StandardScaler(), Ridge(alpha=1.0)),
@@ -783,7 +785,7 @@ for name, task in FAULT_TASKS.items():
     X, g, dt = task['X'], task['groups'], task['data_type']
     y = (task['y'] > 0).astype(int)
     tr, te = SPLITS[name]
-    best, model, cvs = select_and_fit(clf_candidates(), X.iloc[tr], y[tr], g[tr], 'balanced_accuracy')
+    best, model, cvs = select_and_fit(clf_candidates(task.get('soft_vote', False)), X.iloc[tr], y[tr], g[tr], 'balanced_accuracy')
     for m_name, s in cvs.items():
         record(name, dt, 'detection', m_name, 'balanced_accuracy', s, split='cv_train')
     p = model.predict_proba(X.iloc[te])[:, 1]; yhat = (p >= 0.5).astype(int)
@@ -816,15 +818,18 @@ DIAG_TASKS = {n: t for n, t in FAULT_TASKS.items() if t['data_type'] == 'SYNTHET
 if DATA_OK['hydraulic']:
     for comp, nominal in HYD_COMPONENTS.items():
         levels = sorted(hyd_profile[comp].unique())
-        DIAG_TASKS[f'hydraulic:{comp}'] = {'X': hyd_X, 'y': np.searchsorted(levels, hyd_profile[comp].values),
+        acc = comp == 'accumulator'
+        DIAG_TASKS[f'hydraulic:{comp}'] = {'X': hyd_X[HYD_PFP_COLS] if acc else hyd_X,
+                                           'y': np.searchsorted(levels, hyd_profile[comp].values),
                                            'groups': HYD_GROUPS, 'classes': [f'{comp}={l}' for l in levels],
-                                           'nominal': f'{comp}={nominal}', 'data_type': 'REAL', 'split_key': 'hydraulic'}
+                                           'nominal': f'{comp}={nominal}', 'data_type': 'REAL', 'split_key': 'hydraulic',
+                                           'soft_vote': acc}
 
 t0 = time.time()
 for name, task in DIAG_TASKS.items():
     X, y, g, dt = task['X'], task['y'], task['groups'], task['data_type']
     tr, te = SPLITS[task.get('split_key', name)]
-    best, model, cvs = select_and_fit(clf_candidates(), X.iloc[tr], y[tr], g[tr], 'balanced_accuracy')
+    best, model, cvs = select_and_fit(clf_candidates(task.get('soft_vote', False)), X.iloc[tr], y[tr], g[tr], 'balanced_accuracy')
     for m_name, s in cvs.items():
         record(name, dt, 'diagnosis', m_name, 'balanced_accuracy', s, split='cv_train')
     yhat = model.predict(X.iloc[te])
@@ -1140,9 +1145,10 @@ class IVHMSystem:
         self.entries = {}
 
     def register(self, name, data_type, detector=None, diagnoser=None, classes=None, nominal=None,
-                 rul_model=None, rul_feats=None, rul_unit=None, rul_crit=None):
+                 rul_model=None, rul_feats=None, rul_unit=None, rul_crit=None, fault_cols=None):
         self.entries[name] = dict(data_type=data_type, detector=detector, diagnoser=diagnoser, classes=classes,
-                                  nominal=nominal, rul_model=rul_model, rul_feats=rul_feats, rul_unit=rul_unit, rul_crit=rul_crit)
+                                  nominal=nominal, rul_model=rul_model, rul_feats=rul_feats, rul_unit=rul_unit,
+                                  rul_crit=rul_crit, fault_cols=fault_cols)
 
     def assess(self, inputs):
         # inputs: {entry_name: {'fault': 1-row DataFrame of window features, 'rul': 1-row DataFrame of prognostic features}}
@@ -1151,6 +1157,8 @@ class IVHMSystem:
             e = self.entries[name]
             row = {'subsystem': name, 'data_type': e['data_type']}
             status = 'NORMAL'
+            if 'fault' in x and e['fault_cols'] is not None:
+                x = {**x, 'fault': x['fault'][e['fault_cols']]}
             if e['detector'] is not None and 'fault' in x:
                 row['p_fault'] = float(e['detector'].predict_proba(x['fault'])[0, 1])
                 if row['p_fault'] >= 0.5:
@@ -1180,10 +1188,11 @@ for name in SYN_SPECS:
                   classes=DIAG_MODELS[name]['classes'], nominal='normal', rul_model=RUL_MODELS[name]['model'],
                   rul_feats=RUL_MODELS[name]['feats'], rul_unit='flights', rul_crit=CRIT_SYN)
 if DATA_OK['hydraulic']:
-    ivhm.register('hydraulic', 'REAL', detector=DET_MODELS['hydraulic']['model'])
+    ivhm.register('hydraulic', 'REAL', detector=DET_MODELS['hydraulic']['model'], fault_cols=HYD_PFP_COLS)
     for comp in HYD_COMPONENTS:
         d = DIAG_MODELS[f'hydraulic:{comp}']
-        ivhm.register(f'hydraulic:{comp}', 'REAL', diagnoser=d['model'], classes=d['classes'], nominal=d['nominal'])
+        ivhm.register(f'hydraulic:{comp}', 'REAL', diagnoser=d['model'], classes=d['classes'], nominal=d['nominal'],
+                      fault_cols=HYD_PFP_COLS if comp == 'accumulator' else None)
 if 'li_ion_battery' in RUL_MODELS:
     demo_bat = list(BAT_FOLD_MODELS)[-1]      # model trained without this battery, demo sample taken from it
     ivhm.register('li_ion_battery', 'REAL', rul_model=BAT_FOLD_MODELS[demo_bat], rul_feats=BAT_RUL_FEATS,
