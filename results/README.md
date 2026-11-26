@@ -1,21 +1,26 @@
-# Saved results (interim)
+# Results
 
-These are the outputs of runs that have finished so far, all executed on the college GPU server (`bvrit-csm-gpu`) with the code in this repository.
+All runs were executed on the college GPU server (`bvrit-csm-gpu`) with the code in this repository, 5 seeds each.
 
 | Folder | What it is | Code version |
 |---|---|---|
-| `round2_5seeds/` | Complete round-2 evaluation: `seed_summary.csv` (mean / std / min / max over seeds 1–5) and each seed's `all_results.csv` | commit `98f7c19` |
-| `round3_seed1/` | Round-3 seed 1 only: `all_results.csv`, auto-generated test and analysis report, figures | commit `17b16f0` |
+| **`final_5seeds/`** | **Final results.** `Results_Summary.md` (mean ± std, worst seed, pass/fail against 85 %), `seed_summary_heldout.csv`, and each seed's `all_results.csv` | commit `4a071a9` |
+| `round3_5seeds/` | Round 3, kept for traceability | commit `17b16f0` |
+| `round2_5seeds/` | Round 2, kept for traceability | commit `98f7c19` |
 
-Round 3 seeds 2–5 were still running when these files were saved. The final package (`Results_Summary.md` over 5 seeds) is produced by `bash run_seeds.sh` and `make_submission.py`, and it replaces this interim folder.
+The full submission package (models, figures, per-seed reports, code) is attached to the GitHub release `v1.0` as `IVHM_submission.zip`.
 
-## Round 3, seed 1 vs round 2, seed 1 (held-out data, the four tasks that were below 85 %)
+## Final headline (held-out data, mean of 5 seeds)
 
-| Task | Data | Round 2 | Round 3 |
+33 of 35 headline rows reach 85 % on the mean: REAL 6/7, SIMULATED-BENCHMARK 1/2 (the 1D-CNN passes; the tree baseline does not), SYNTHETIC 24/24.
+
+| Task | Round 2 | Round 3 | Final |
 |---|---|---|---|
-| Li-ion battery RUL, state accuracy | REAL | 0.782 | 0.864 |
-| Electronics RUL, state accuracy | SYNTHETIC | 0.851 | 0.908 |
-| Fuel RUL, state accuracy | SYNTHETIC | 0.889 | 0.916 |
-| Hydraulic accumulator diagnosis, balanced accuracy | REAL | 0.840 | 0.783 |
+| Li-ion battery RUL (REAL) | 0.782 | 0.873 | **0.873 ± 0.005** |
+| Electronics RUL | 0.817 | 0.892 | **0.892 ± 0.026** |
+| Fuel RUL | 0.843 | 0.901 | **0.901 ± 0.024** |
+| Hydraulic critical-fault detection (REAL) | 0.868 | 0.883 | **0.915 ± 0.079** |
+| C-MAPSS RUL, 1D-CNN | 0.860 | 0.860 | **0.860 ± 0.014** |
+| Hydraulic accumulator (REAL) | 0.776 | 0.747 | **0.766 ± 0.026**, below target |
 
-These are single-seed figures. The 5-seed round-2 means for the same tasks were 0.782, 0.817, 0.843 and 0.776 (see `round2_5seeds/seed_summary.csv`). For the accumulator, training cross-validation was about 0.82 in both rounds, and its test score swings between 0.72 and 0.84 across seeds, so the seed-1 drop is within that range. Final conclusions should wait for the 5-seed summary.
+The accumulator explanation and the C-MAPSS model-choice note are in `docs/IVHM_Technical_Report.md`, section 8.
